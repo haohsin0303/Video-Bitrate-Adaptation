@@ -1,0 +1,232 @@
+#!/usr/bin/env python3.10
+
+
+import select
+import sys
+import time
+import re
+from socket import socket, AF_INET, SOCK_STREAM
+from threading import Thread
+
+
+# constants
+SERVER_PORT = 8080
+MAX_SOCKET_AMOUNT = 512
+BUFFER_SIZE = 4096
+MANIFEST_SIZE = 4096
+
+
+def get_content_length(message):
+	"""
+	get content length from message
+	"""
+	pattern = re.compile(b'Content-Length: \w+')
+	content_length = pattern.findall(message)
+	if content_length:
+		return float(content_length[0][16:])
+	return 0
+
+
+def get_chunk_name(message):
+	chunk_name_list = re.findall(re.compile(b'GET.+HTTP'), message)
+	return str(chunk_name_list[0][4:-5])
+
+
+def calculate_throughput(content_length, duration):
+	"""
+	calculate current throughput
+	"""
+	throughput = content_length * 8 / duration
+	return throughput
+
+
+def calculate_EWMA(avg_throughput, new_throughput, alpha):
+	"""
+	calculate average throughput (exponentially-weighted moving average (EWMA))
+	"""
+	avg_throughput = alpha * new_throughput + (1 - alpha) * avg_throughput
+	return avg_throughput
+
+
+def get_bitrates(manifest_file, bitrates):
+	"""
+	get all the supporting bitrates from manifest file
+	"""
+	bandwidths = re.findall(re.compile(b'bandwidth="\w+"'), manifest_file)
+	for bandwidth in bandwidths:
+		bitrates.append(int(bandwidth.decode()[11:-1]))
+	bitrates.sort()
+
+
+def choose_bitrate(avg_throughput, bitrates):
+	"""
+	choose bitrate from all the supporting bitrates
+	a connection can support a bitrate if the average throughput is at least 1.5 times the bitrate
+	"""
+	max_bitrate = avg_throughput / 1.5
+	for i in range(len(bitrates)):
+		if bitrates[i] >= max_bitrate:
+			return bitrates[i]
+
+	return bitrates[-1]
+
+
+def log_message(log, duration, tput, avg_tput, bitrate, web_server_ip, chunk_name):
+	"""
+	logging format:
+	<time> <duration> <tput> <avg-tput> <bitrate> <server-ip> <chunkname>
+	"""
+	if bitrate != 0:
+		now = time.time()
+		log_msg = str(now) + " " + str(duration) + " " + str(tput/1000) + " " + str(avg_tput/1000) + " " + \
+				str(bitrate/1000) + " " + web_server_ip + " " + chunk_name + "\n"
+		with open(log, "a") as f:
+			f.write(log_msg)
+
+
+def connect(clientSocket, log, alpha, fake_ip, web_server_ip, throughput_table, bitrates):
+
+	# init connection socket
+	connectionSocket, address = clientSocket.accept()
+
+	# connect to server
+	serverSocket = socket(AF_INET, SOCK_STREAM)
+	serverSocket.bind((fake_ip, 0))
+	serverSocket.connect((web_server_ip, SERVER_PORT))
+
+	# init variables
+	chunk_name = ""
+	chosen_bitrate = 0
+	bitrates = []
+	inputs = [connectionSocket, serverSocket]
+
+	while True:
+
+		# wait for io
+		readable, _, _ = select.select(inputs, [], inputs)
+
+		# init time variables
+		ts = time.time()
+		tf = time.time()
+
+		# init average throughput
+		# if (web_server_ip, address) doesn't exist, initialize it with the smallest bitrate
+		if throughput_table.get((web_server_ip, address)) is None:
+			throughput_table[(web_server_ip, address)] = bitrates[0] if bitrates else 0
+
+		# handle inputs
+		for sckt in readable:
+			message = sckt.recv(BUFFER_SIZE)
+			if message:
+				if sckt is serverSocket:
+					"""
+					Message from server side
+					"""
+
+					# calculate log info
+					tf = time.time()
+					duration = tf - ts
+					content_length = get_content_length(message)
+					throughput = calculate_throughput(content_length, duration)
+					avg_throughput = throughput_table[(web_server_ip, address)] # get avg_throughput from throughput_table
+					avg_throughput = calculate_EWMA(avg_throughput, throughput, alpha) # calculate new avg_throughput
+					throughput_table[(web_server_ip, address)] = avg_throughput # update throughput_table
+					log_message(log, duration, throughput, avg_throughput, chosen_bitrate, web_server_ip, chunk_name)
+
+					# forward the message to the client
+					connectionSocket.send(message)
+
+				else:
+					"""
+					Message from client side
+					"""
+	
+					ts = time.time() # get current time to calculate throughput
+					chunk_name = get_chunk_name(message) # get chunk_name for future log
+			
+					request_manifest_file = re.search(re.compile(b'BigBuckBunny_6s.mpd'), message)
+					if request_manifest_file:
+						"""
+						Request for manifest file
+						case 1: Already have supporting bitrates information
+							- modify the request to "nolist" and send it to the server
+						case 2: Not yet have supporting bitrates information
+							- send the request to the server to get manifest file
+							- store supporting bitrates
+							- modify the request to "nolist" and send it to the server again
+						"""
+						if not bitrates:
+							serverSocket.send(message)
+							manifest_file = serverSocket.recv(MANIFEST_SIZE)
+							get_bitrates(manifest_file, bitrates)
+							if throughput_table[(web_server_ip, address)] == 0:
+								throughput_table[(web_server_ip, address)] = bitrates[0]
+
+						# request for nolist mpd file
+						message = message.replace(b'BigBuckBunny_6s.mpd', b'BigBuckBunny_6s_nolist.mpd')
+						serverSocket.send(message)
+
+					else:
+						"""
+						Request for video or other files
+						case 1: Request for video with bitrate information
+							- format: GET /bunny_506300bps/BigBuckBunny_6s1.m4s
+							- modify the bitrate information to our chosen bitrate
+							- send the request to the server
+						case 2: Request for other files
+							- send the request to the server
+						"""
+						request_with_bitrates = re.findall(re.compile(b'bunny_\w+bps'), message)
+						if request_with_bitrates:
+							chosen_bitrate = choose_bitrate(throughput_table[(web_server_ip, address)], bitrates)
+							message = message.replace(request_with_bitrates[0], b'bunny_' + str(chosen_bitrate).encode() + b'bps')
+						
+						serverSocket.send(message)
+
+	# close connection
+	connectionSocket.close()
+	serverSocket.close()
+
+
+class Proxy:
+	def __init__(self, log, alpha, listen_port, fake_ip, web_server_ip):
+		self.log = log
+		self.alpha = alpha
+		self.fake_ip = fake_ip
+		self.web_server_ip = web_server_ip
+		self.clientSocket = socket(AF_INET, SOCK_STREAM)
+		self.clientSocket.bind((fake_ip, listen_port))
+		self.clientSocket.listen(MAX_SOCKET_AMOUNT)
+		self.throughput_table = dict()
+		self.bitrates = []
+	
+	def start(self):
+		while True:
+			thread = Thread(
+				target=connect,
+				args=(
+					self.clientSocket,
+					self.log,
+					self.alpha,
+					self.fake_ip,
+					self.web_server_ip,
+					self.throughput_table,
+					self.bitrates
+				)
+			)
+			thread.start()
+			thread.join()
+
+
+if __name__ == "__main__":
+
+	# get input argv
+	log = sys.argv[1]
+	alpha = float(sys.argv[2])
+	listen_port = int(sys.argv[3])
+	fake_ip = sys.argv[4]
+	web_server_ip = sys.argv[5]
+
+	# start proxy
+	proxy = Proxy(log, alpha, listen_port, fake_ip, web_server_ip)
+	proxy.start()
